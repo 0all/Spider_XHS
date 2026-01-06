@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,11 +23,19 @@ type Signature struct {
 }
 
 // Signer computes xs/xt/xs-common fully in Go (no external Node.js runtime).
-type Signer struct{}
+type Signer struct {
+	randSource io.Reader
+	nowFn      func() time.Time
+}
 
-// NewSigner creates a signer instance.
+// NewSigner creates a signer instance with runtime randomness.
 func NewSigner() *Signer {
-	return &Signer{}
+	return &Signer{randSource: rand.Reader, nowFn: time.Now}
+}
+
+// NewDeterministicSigner creates a signer with injected randomness/time for testing.
+func NewDeterministicSigner(r io.Reader, now func() time.Time) *Signer {
+	return &Signer{randSource: r, nowFn: now}
 }
 
 // Sign produces xs/xt/xs-common values for the given request metadata.
@@ -34,8 +43,16 @@ func (s *Signer) Sign(api, method, a1 string, payload interface{}) (*Signature, 
 	if a1 == "" {
 		return nil, fmt.Errorf("cookie a1 is required for signing")
 	}
-	xs := signXs(strings.ToUpper(method), api, strings.TrimSpace(a1), "xhs-pc-web", payload)
-	xt := time.Now().UnixMilli()
+	now := s.nowFn
+	r := s.randSource
+	if now == nil {
+		now = time.Now
+	}
+	if r == nil {
+		r = rand.Reader
+	}
+	xs := signXsWithSources(strings.ToUpper(method), api, strings.TrimSpace(a1), "xhs-pc-web", payload, r, now)
+	xt := now().UnixMilli()
 	xsCommon := xsCommon(strings.TrimSpace(a1), xs, xt)
 	return &Signature{
 		Xs:       xs,
@@ -67,9 +84,13 @@ var (
 )
 
 func signXs(method, uri, a1, appID string, payload interface{}) string {
+	return signXsWithSources(method, uri, a1, appID, payload, rand.Reader, time.Now)
+}
+
+func signXsWithSources(method, uri, a1, appID string, payload interface{}, r io.Reader, now func() time.Time) string {
 	content := buildContentString(method, uri, payload)
 	dVal := md5Hex(content)
-	body := buildPayload(dVal, a1, appID, content)
+	body := buildPayload(dVal, a1, appID, content, now, r)
 	xor := xorArray(body)
 	x3Body := encodeX3(xor[:124])
 	x3Full := x3Prefix + x3Body
@@ -88,8 +109,11 @@ func signXs(method, uri, a1, appID string, payload interface{}) string {
 
 func buildContentString(method, uri string, payload interface{}) string {
 	if strings.ToUpper(method) == "POST" {
+		if raw, ok := payload.(json.RawMessage); ok {
+			return uri + string(raw)
+		}
 		if payload == nil {
-			return uri + "null"
+			return uri + "{}"
 		}
 		b, _ := json.Marshal(payload)
 		return uri + string(b)
@@ -133,17 +157,20 @@ func md5Hex(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func rand32() uint32 {
+func rand32(r io.Reader) uint32 {
 	var b [4]byte
-	_, _ = rand.Read(b[:])
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		// fallback: deterministic but still returns a value
+		return 0
+	}
 	return binary.LittleEndian.Uint32(b[:])
 }
 
-func randByte(min, max int) byte {
+func randRange(r io.Reader, min, max int) uint32 {
 	if max <= min {
-		return byte(min)
+		return uint32(min)
 	}
-	return byte(min + int(rand32()%(uint32(max-min+1))))
+	return uint32(min) + rand32(r)%uint32(max-min+1)
 }
 
 func intToLE(val uint32, length int) []byte {
@@ -180,26 +207,26 @@ func envFingerprintB(ts int64) []byte {
 	return structPackLittleEndianQ(ts)
 }
 
-func buildPayload(dHex, a1, appID, content string) []byte {
+func buildPayload(dHex, a1, appID, content string, now func() time.Time, r io.Reader) []byte {
 	payload := make([]byte, 0, 200)
 	payload = append(payload, versionBytes...)
 
-	seed := rand32()
+	seed := rand32(r)
 	seedBytes := intToLE(seed, 4)
 	payload = append(payload, seedBytes...)
 	seedByte0 := seedBytes[0]
 
-	timestamp := time.Now().UnixMilli()
+	timestamp := now().UnixMilli()
 	payload = append(payload, envFingerprintA(timestamp, 41)...)
 
-	timeOffset := randByte(10, 50)
+	timeOffset := randRange(r, 10, 50)
 	payload = append(payload, envFingerprintB(timestamp-int64(timeOffset))...)
 
-	sequenceValue := randByte(15, 50)
-	payload = append(payload, intToLE(uint32(sequenceValue), 4)...)
+	sequenceValue := randRange(r, 15, 50)
+	payload = append(payload, intToLE(sequenceValue, 4)...)
 
-	windowPropsLength := randByte(900, 1200)
-	payload = append(payload, intToLE(uint32(windowPropsLength), 4)...)
+	windowPropsLength := randRange(r, 900, 1200)
+	payload = append(payload, intToLE(windowPropsLength, 4)...)
 
 	uriLength := len([]byte(content))
 	payload = append(payload, intToLE(uint32(uriLength), 4)...)
@@ -231,8 +258,9 @@ func buildPayload(dHex, a1, appID, content string) []byte {
 
 func xorArray(arr []byte) []byte {
 	out := make([]byte, len(arr))
+	keyLen := len(hexKeyBytes)
 	for i, b := range arr {
-		out[i] = (b ^ hexKeyBytes[i]) & 0xff
+		out[i] = (b ^ hexKeyBytes[i%keyLen]) & 0xff
 	}
 	return out
 }
@@ -296,22 +324,37 @@ func crc32Custom(input string) uint32 {
 }
 
 func xsCommon(a1, xs string, xt int64) string {
-	data := map[string]interface{}{
-		"s0":  5,
-		"s1":  "",
-		"x0":  "1",
-		"x1":  "4.2.6",
-		"x2":  "Windows",
-		"x3":  "xhs-pc-web",
-		"x4":  "4.84.1",
-		"x5":  a1,
-		"x6":  xt,
-		"x7":  xs,
-		"x8":  fff,
-		"x9":  crc32Custom(strconv.FormatInt(xt, 10) + xs + fff),
-		"x10": 0,
-		"x11": "normal",
+	payloadStruct := struct {
+		S0  int    `json:"s0"`
+		S1  string `json:"s1"`
+		X0  string `json:"x0"`
+		X1  string `json:"x1"`
+		X2  string `json:"x2"`
+		X3  string `json:"x3"`
+		X4  string `json:"x4"`
+		X5  string `json:"x5"`
+		X6  int64  `json:"x6"`
+		X7  string `json:"x7"`
+		X8  string `json:"x8"`
+		X9  int32  `json:"x9"`
+		X10 int    `json:"x10"`
+		X11 string `json:"x11"`
+	}{
+		S0:  5,
+		S1:  "",
+		X0:  "1",
+		X1:  "4.2.6",
+		X2:  "Windows",
+		X3:  "xhs-pc-web",
+		X4:  "4.84.1",
+		X5:  a1,
+		X6:  xt,
+		X7:  xs,
+		X8:  fff,
+		X9:  int32(crc32Custom(strconv.FormatInt(xt, 10) + xs + fff)),
+		X10: 0,
+		X11: "normal",
 	}
-	payload, _ := json.Marshal(data)
+	payload, _ := json.Marshal(payloadStruct)
 	return b64Encode(encodeUtf8(string(payload)))
 }

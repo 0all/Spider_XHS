@@ -163,7 +163,18 @@ func (c *Client) requestJSON(ctx context.Context, method, api string, payload in
 }
 
 func (c *Client) buildHeaders(ctx context.Context, api, method string, payload interface{}) (http.Header, []byte, error) {
-	sig, err := c.signer.Sign(api, method, c.cookies["a1"], payload)
+	var body []byte
+	payloadForSign := payload
+	if payload != nil {
+		var err error
+		body, err = json.Marshal(payload)
+		if err != nil {
+			return nil, nil, fmt.Errorf("marshal payload: %w", err)
+		}
+		payloadForSign = json.RawMessage(body)
+	}
+
+	sig, err := c.signer.Sign(api, method, c.cookies["a1"], payloadForSign)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -175,13 +186,6 @@ func (c *Client) buildHeaders(ctx context.Context, api, method string, payload i
 	tpl.Set("x-b3-traceid", randomTraceID(21))
 	tpl.Set("cookie", c.cookieHeader)
 
-	var body []byte
-	if payload != nil {
-		body, err = json.Marshal(payload)
-		if err != nil {
-			return nil, nil, fmt.Errorf("marshal payload: %w", err)
-		}
-	}
 	return tpl, body, nil
 }
 
